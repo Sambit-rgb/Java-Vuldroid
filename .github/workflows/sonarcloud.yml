@@ -1,67 +1,141 @@
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
-
-# This workflow helps you trigger a SonarCloud analysis of your code and populates
-# GitHub Code Scanning alerts with the vulnerabilities found.
-# Free for open source project.
-
-# 1. Login to SonarCloud.io using your GitHub account
-
-# 2. Import your project on SonarCloud
-#     * Add your GitHub organization first, then add your repository as a new project.
-#     * Please note that many languages are eligible for automatic analysis,
-#       which means that the analysis will start automatically without the need to set up GitHub Actions.
-#     * This behavior can be changed in Administration > Analysis Method.
-#
-# 3. Follow the SonarCloud in-product tutorial
-#     * a. Copy/paste the Project Key and the Organization Key into the args parameter below
-#          (You'll find this information in SonarCloud. Click on "Information" at the bottom left)
-#
-#     * b. Generate a new token and add it to your Github repository's secrets using the name SONAR_TOKEN
-#          (On SonarCloud, click on your avatar on top-right > My account > Security
-#           or go directly to https://sonarcloud.io/account/security/)
-
-# Feel free to take a look at our documentation (https://docs.sonarcloud.io/getting-started/github/)
-# or reach out to our community forum if you need some help (https://community.sonarsource.com/c/help/sc/9)
-
-name: SonarCloud analysis
+name: Multi-Module Smart Sonar Scan
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "main" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "main" ]
   workflow_dispatch:
 
 permissions:
-  pull-requests: read # allows SonarCloud to decorate PRs with analysis results
+  pull-requests: read
 
 jobs:
-  Analysis:
+  sonar:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Analyze with SonarCloud
+      # ✅ Checkout
+      - name: Checkout
+        uses: actions/checkout@v4
 
-        # You can pin the exact commit or the version.
-        # uses: SonarSource/sonarcloud-github-action@v2.2.0
-        uses: SonarSource/sonarcloud-github-action@4006f663ecaf1f8093e8e4abb9227f6041f52216
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}   # Generate a token on Sonarcloud.io, add it to the secrets of this repo with the name SONAR_TOKEN (Settings > Secrets > Actions > add new repository secret)
+      # ✅ Setup Java
+      - name: Setup JDK 8
+        uses: actions/setup-java@v4
         with:
-          # Additional arguments for the SonarScanner CLI
-          args:
-            # Unique keys of your project and organization. You can find them in SonarCloud > Information (bottom-left menu)
-            # mandatory
-            -Dsonar.projectKey=Sambit-rgb_Java-Vuldroid
-            -Dsonar.organization=sambit-rgb
-            # Comma-separated paths to directories containing main source files.
-            #-Dsonar.sources= # optional, default is project base directory
-            # Comma-separated paths to directories containing test source files.
-            #-Dsonar.tests= # optional. For more info about Code Coverage, please refer to https://docs.sonarcloud.io/enriching/test-coverage/overview/
-            # Adds more detail to both client and server-side analysis logs, activating DEBUG mode for the scanner, and adding client-side environment variables and system properties to the server-side log of analysis report processing.
-            #-Dsonar.verbose= # optional, default is false
-          # When you need the analysis to take place in a directory other than the one from which it was launched, default is .
-          projectBaseDir: .
+          distribution: temurin
+          java-version: 8
+
+      # ✅ Discover ALL modules (Gradle + Maven)
+      - name: Discover modules
+        id: discover
+        run: |
+          echo "Scanning for modules..."
+
+          MODULES=$(find . -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "settings.gradle" \) \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" \
+            | sed 's|/[^/]*$||' \
+            | sort -u)
+
+          if [ -z "$MODULES" ]; then
+            echo "No modules found, defaulting to root"
+            MODULES="."
+          fi
+
+          echo "Detected modules:"
+          echo "$MODULES"
+
+          # Save as multiline output
+          echo "modules<<EOF" >> $GITHUB_OUTPUT
+          echo "$MODULES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # ✅ Auto-create Sonar projects (per module)
+      - name: Create Sonar projects
+        run: |
+          while IFS= read -r module; do
+            NAME=$(basename "$module")
+            KEY="sambit-rgb_${GITHUB_REPOSITORY##*/}_$(echo $NAME | tr ' /' '_')"
+
+            echo "Creating project: $KEY"
+
+            curl -u $SONAR_TOKEN: \
+              -X POST "https://sonarcloud.io/api/projects/create" \
+              -d "name=$NAME" \
+              -d "project=$KEY" \
+              -d "organization=sambit-rgb" || true
+
+          done <<< "${{ steps.discover.outputs.modules }}"
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      # ✅ Build + Scan EACH module
+      - name: Build and Scan modules
+        run: |
+          while IFS= read -r module; do
+
+            echo "===================================="
+            echo "Processing module: $module"
+            echo "===================================="
+
+            NAME=$(basename "$module")
+            KEY="sambit-rgb_${GITHUB_REPOSITORY##*/}_$(echo $NAME | tr ' /' '_')"
+
+            cd "$module"
+
+            # 🔍 Detect build tool
+            if [ -f "gradlew" ]; then
+              BUILD="gradle-wrapper"
+            elif [ -f "build.gradle" ]; then
+              BUILD="gradle"
+            elif [ -f "pom.xml" ]; then
+              BUILD="maven"
+            else
+              BUILD="none"
+            fi
+
+            echo "Build tool: $BUILD"
+
+            # 🔨 Try build (ignore failure)
+            if [ "$BUILD" = "gradle-wrapper" ]; then
+              chmod +x gradlew
+              ./gradlew assembleDebug --no-daemon || echo "Build failed"
+
+            elif [ "$BUILD" = "gradle" ]; then
+              sudo apt-get update && sudo apt-get install -y gradle
+              gradle build || echo "Build failed"
+
+            elif [ "$BUILD" = "maven" ]; then
+              mvn clean install -DskipTests || echo "Build failed"
+
+            else
+              echo "Skipping build"
+            fi
+
+            # 🔍 Detect binaries
+            BIN=$(find . -type d \( -path "*/build/classes*" -o -path "*/target/classes*" \) | head -n 1)
+
+            if [ -z "$BIN" ]; then
+              echo "No binaries → fallback"
+              BIN="."
+            fi
+
+            echo "Using binaries: $BIN"
+
+            cd -
+
+            # 🚀 Run Sonar scan per module
+            sonar-scanner \
+              -Dsonar.projectKey=Sambit-rgb_Java-Vuldroid \
+              -Dsonar.organization=sambit-rgb \
+              -Dsonar.sources="$module" \
+              -Dsonar.java.binaries="$module/$BIN" \
+              -Dsonar.java.binaries.fallbackToEmpty=true \
+              -Dsonar.verbose=true \
+              -Dsonar.host.url=https://sonarcloud.io \
+              -Dsonar.login=${SONAR_TOKEN}
+
+          done <<< "${{ steps.discover.outputs.modules }}"
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
