@@ -26,7 +26,21 @@ jobs:
           distribution: temurin
           java-version: 8
 
-      # ✅ Discover ALL modules (Gradle + Maven)
+      # ✅ Install SonarScanner (FIXED)
+      - name: Install SonarScanner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip curl
+
+          curl -sSLo scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+          unzip -q scanner.zip
+
+          SCANNER_DIR=$(find . -type d -name "sonar-scanner-*" | head -n 1)
+
+          echo "SCANNER_HOME=$SCANNER_DIR" >> $GITHUB_ENV
+          echo "$SCANNER_DIR/bin" >> $GITHUB_PATH
+
+      # ✅ Discover modules (SPACE SAFE)
       - name: Discover modules
         id: discover
         run: |
@@ -46,17 +60,17 @@ jobs:
           echo "Detected modules:"
           echo "$MODULES"
 
-          # Save as multiline output
           echo "modules<<EOF" >> $GITHUB_OUTPUT
           echo "$MODULES" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      # ✅ Auto-create Sonar projects (per module)
+      # ✅ Auto-create Sonar projects
       - name: Create Sonar projects
         run: |
           while IFS= read -r module; do
             NAME=$(basename "$module")
-            KEY="sambit-rgb_${GITHUB_REPOSITORY##*/}_$(echo $NAME | tr ' /' '_')"
+            SAFE_NAME=$(echo "$NAME" | tr ' /' '_')
+            KEY="sambit-rgb_${GITHUB_REPOSITORY##*/}_$SAFE_NAME"
 
             echo "Creating project: $KEY"
 
@@ -70,7 +84,7 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-      # ✅ Build + Scan EACH module
+      # ✅ Build + Scan modules
       - name: Build and Scan modules
         run: |
           while IFS= read -r module; do
@@ -80,9 +94,12 @@ jobs:
             echo "===================================="
 
             NAME=$(basename "$module")
-            KEY="sambit-rgb_${GITHUB_REPOSITORY##*/}_$(echo $NAME | tr ' /' '_')"
+            SAFE_NAME=$(echo "$NAME" | tr ' /' '_')
+            KEY="sambit-rgb_${GITHUB_REPOSITORY##*/}_$SAFE_NAME"
 
-            cd "$module"
+            echo "Project Key: $KEY"
+
+            pushd "$module" > /dev/null
 
             # 🔍 Detect build tool
             if [ -f "gradlew" ]; then
@@ -121,20 +138,22 @@ jobs:
               BIN="."
             fi
 
-            echo "Using binaries: $BIN"
+            FULL_BIN="$module/$BIN"
 
-            cd -
+            popd > /dev/null
 
-            # 🚀 Run Sonar scan per module
-            sonar-scanner \
+            echo "Using binaries: $FULL_BIN"
+
+            # 🚀 Sonar Scan (FIXED)
+            $SCANNER_HOME/bin/sonar-scanner \
               -Dsonar.projectKey=Sambit-rgb_Java-Vuldroid \
               -Dsonar.organization=sambit-rgb \
               -Dsonar.sources="$module" \
-              -Dsonar.java.binaries="$module/$BIN" \
+              -Dsonar.java.binaries="$FULL_BIN" \
               -Dsonar.java.binaries.fallbackToEmpty=true \
-              -Dsonar.verbose=true \
               -Dsonar.host.url=https://sonarcloud.io \
-              -Dsonar.login=${SONAR_TOKEN}
+              -Dsonar.login=${SONAR_TOKEN} \
+              -Dsonar.verbose=true
 
           done <<< "${{ steps.discover.outputs.modules }}"
         env:
